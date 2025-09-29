@@ -1,315 +1,599 @@
 /*
- * MSE Controller for mpegts.js
- * Modified to handle enhanced MEDIA_INFO events with color metadata
+ * Copyright (C) 2016 Bilibili. All Rights Reserved.
+ *
+ * @author zheng qian <xqq@xqq.im>
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
-import {
-    BaseController
-} from './base-controller.js';
-import {
-    Events,
-    ErrorTypes,
-    ErrorDetails
-} from '../utils/events.js';
-import {
-    Log
-} from '../utils/logger.js';
-import {
-    Transmuxer
-} from './transmuxer.js';
+import EventEmitter from 'events';
+import Log from '../utils/logger.js';
+import Browser from '../utils/browser.js';
+import MSEEvents from './mse-events';
+import {IllegalStateException} from '../utils/exception.js';
 
-class MSEController extends BaseController {
-    constructor(mediaElement, config) {
-        super();
+// Media Source Extensions controller
+class MSEController {
 
+    constructor(config) {
         this.TAG = 'MSEController';
-        this._config = config || {};
-        this._mediaElement = mediaElement;
+
+        this._config = config;
+        this._emitter = new EventEmitter();
+
+        if (this._config.isLive && this._config.autoCleanupSourceBuffer == undefined) {
+            // For live stream, do auto cleanup by default
+            this._config.autoCleanupSourceBuffer = true;
+        }
+
+        this.e = {
+            onSourceOpen: this._onSourceOpen.bind(this),
+            onSourceEnded: this._onSourceEnded.bind(this),
+            onSourceClose: this._onSourceClose.bind(this),
+            onStartStreaming: this._onStartStreaming.bind(this),
+            onEndStreaming: this._onEndStreaming.bind(this),
+            onQualityChange: this._onQualityChange.bind(this),
+            onSourceBufferError: this._onSourceBufferError.bind(this),
+            onSourceBufferUpdateEnd: this._onSourceBufferUpdateEnd.bind(this)
+        };
+
+        // Use ManagedMediaSource only if w3c MediaSource is not available (e.g. iOS Safari)
+        this._useManagedMediaSource = ('ManagedMediaSource' in self) && !('MediaSource' in self);
 
         this._mediaSource = null;
-        this._sourceBuffer = null;
-        this._mimeType = null;
-        this._transmuxer = null;
+        this._mediaSourceObjectURL = null;
+
+        this._mediaElementProxy = null;
+
         this._isBufferFull = false;
-        this._hasPendingData = false;
-        this._pendingData = [];
-        this._pendingDataSize = 0;
-        this._pendingAppendLength = 0;
+        this._hasPendingEos = false;
 
-        this._mediaInfo = null;
-        this._stats = {};
-        this._audioCodec = '';
-        this._videoCodec = '';
+        this._requireSetMediaDuration = false;
+        this._pendingMediaDuration = 0;
 
-        this._onSourceOpen = this._onSourceOpen.bind(this);
-        this._onSourceEnded = this._onSourceEnded.bind(this);
-        this._onSourceClose = this._onSourceClose.bind(this);
-        this._onUpdateEnd = this._onUpdateEnd.bind(this);
-        this._onBufferFull = this._onBufferFull.bind(this);
-
-        this._mediaSource = new window.MediaSource();
-        this._mediaSource.addEventListener('sourceopen', this._onSourceOpen);
-        this._mediaSource.addEventListener('sourceended', this._onSourceEnded);
-        this._mediaSource.addEventListener('sourceclose', this._onSourceClose);
-
-        mediaElement.src = window.URL.createObjectURL(this._mediaSource);
+        this._pendingSourceBufferInit = [];
+        this._mimeTypes = {
+            video: null,
+            audio: null
+        };
+        this._sourceBuffers = {
+            video: null,
+            audio: null
+        };
+        this._lastInitSegments = {
+            video: null,
+            audio: null
+        };
+        this._pendingSegments = {
+            video: [],
+            audio: []
+        };
+        this._pendingRemoveRanges = {
+            video: [],
+            audio: []
+        };
     }
 
     destroy() {
-        if (this._transmuxer) {
-            this._transmuxer.destroy();
-            this._transmuxer = null;
-        }
-
-        if (this._sourceBuffer) {
-            this._sourceBuffer.removeEventListener('updateend', this._onUpdateEnd);
-            this._sourceBuffer = null;
-        }
-
         if (this._mediaSource) {
-            this._mediaSource.removeEventListener('sourceopen', this._onSourceOpen);
-            this._mediaSource.removeEventListener('sourceended', this._onSourceEnded);
-            this._mediaSource.removeEventListener('sourceclose', this._onSourceClose);
+            this.shutdown();
+        }
+        if (this._mediaSourceObjectURL) {
+            this.revokeObjectURL();
+        }
+        this.e = null;
+        this._emitter.removeAllListeners();
+        this._emitter = null;
+    }
 
+    on(event, listener) {
+        this._emitter.addListener(event, listener);
+    }
+
+    off(event, listener) {
+        this._emitter.removeListener(event, listener);
+    }
+
+    initialize(mediaElementProxy) {
+        if (this._mediaSource) {
+            throw new IllegalStateException('MediaSource has been attached to an HTMLMediaElement!');
+        }
+
+        if (this._useManagedMediaSource) {
+            Log.v(this.TAG, 'Using ManagedMediaSource');
+        }
+
+        let ms = this._mediaSource = this._useManagedMediaSource ? new self.ManagedMediaSource() : new self.MediaSource();
+        ms.addEventListener('sourceopen', this.e.onSourceOpen);
+        ms.addEventListener('sourceended', this.e.onSourceEnded);
+        ms.addEventListener('sourceclose', this.e.onSourceClose);
+
+        if (this._useManagedMediaSource) {
+            ms.addEventListener('startstreaming', this.e.onStartStreaming);
+            ms.addEventListener('endstreaming', this.e.onEndStreaming);
+            ms.addEventListener('qualitychange', this.e.onQualityChange);
+        }
+
+        this._mediaElementProxy = mediaElementProxy;
+    }
+
+    shutdown() {
+        if (this._mediaSource) {
+            let ms = this._mediaSource;
+            for (let type in this._sourceBuffers) {
+                // pending segments should be discard
+                let ps = this._pendingSegments[type];
+                ps.splice(0, ps.length);
+                this._pendingSegments[type] = null;
+                this._pendingRemoveRanges[type] = null;
+                this._lastInitSegments[type] = null;
+
+                // remove all sourcebuffers
+                let sb = this._sourceBuffers[type];
+                if (sb) {
+                    if (ms.readyState !== 'closed') {
+                        // ms edge can throw an error: Unexpected call to method or property access
+                        try {
+                            ms.removeSourceBuffer(sb);
+                        } catch (error) {
+                            Log.e(this.TAG, error.message);
+                        }
+                        sb.removeEventListener('error', this.e.onSourceBufferError);
+                        sb.removeEventListener('updateend', this.e.onSourceBufferUpdateEnd);
+                    }
+                    this._mimeTypes[type] = null;
+                    this._sourceBuffers[type] = null;
+                }
+            }
+            if (ms.readyState === 'open') {
+                try {
+                    ms.endOfStream();
+                } catch (error) {
+                    Log.e(this.TAG, error.message);
+                }
+            }
+            this._mediaElementProxy = null;
+            ms.removeEventListener('sourceopen', this.e.onSourceOpen);
+            ms.removeEventListener('sourceended', this.e.onSourceEnded);
+            ms.removeEventListener('sourceclose', this.e.onSourceClose);
+            if (this._useManagedMediaSource) {
+                ms.removeEventListener('startstreaming', this.e.onStartStreaming);
+                ms.removeEventListener('endstreaming', this.e.onEndStreaming);
+                ms.removeEventListener('qualitychange', this.e.onQualityChange);
+            }
+            this._pendingSourceBufferInit = [];
+            this._isBufferFull = false;
+            this._mediaSource = null;
+        }
+    }
+
+    isManagedMediaSource() {
+        return this._useManagedMediaSource;
+    }
+
+    getObject() {
+        if (!this._mediaSource) {
+            throw new IllegalStateException('MediaSource has not been initialized yet!');
+        }
+        return this._mediaSource;
+    }
+
+    getHandle() {
+        if (!this._mediaSource) {
+            throw new IllegalStateException('MediaSource has not been initialized yet!');
+        }
+        return this._mediaSource.handle;
+    }
+
+    getObjectURL() {
+        if (!this._mediaSource) {
+            throw new IllegalStateException('MediaSource has not been initialized yet!');
+        }
+
+        if (this._mediaSourceObjectURL == null) {
+            this._mediaSourceObjectURL = URL.createObjectURL(this._mediaSource);
+        }
+        return this._mediaSourceObjectURL;
+    }
+
+    revokeObjectURL() {
+        if (this._mediaSourceObjectURL) {
+            URL.revokeObjectURL(this._mediaSourceObjectURL);
+            this._mediaSourceObjectURL = null;
+        }
+    }
+
+    appendInitSegment(initSegment, deferred = undefined) {
+        if (!this._mediaSource || this._mediaSource.readyState !== 'open' || this._mediaSource.streaming === false) {
+            // sourcebuffer creation requires mediaSource.readyState === 'open'
+            // so we defer the sourcebuffer creation, until sourceopen event triggered
+            this._pendingSourceBufferInit.push(initSegment);
+            // make sure that this InitSegment is in the front of pending segments queue
+            this._pendingSegments[initSegment.type].push(initSegment);
+            return;
+        }
+
+        let is = initSegment;
+        let mimeType = `${is.container}`;
+        if (is.codec && is.codec.length > 0) {
+            if (is.codec === 'opus' && Browser.safari) {
+                is.codec = 'Opus';
+            }
+            mimeType += `;codecs=${is.codec}`;
+        }
+
+        let firstInitSegment = false;
+
+        Log.v(this.TAG, 'Received Initialization Segment, mimeType: ' + mimeType);
+        this._lastInitSegments[is.type] = is;
+
+        if (mimeType !== this._mimeTypes[is.type]) {
+            if (!this._mimeTypes[is.type]) {  // empty, first chance create sourcebuffer
+                firstInitSegment = true;
+                try {
+                    let sb = this._sourceBuffers[is.type] = this._mediaSource.addSourceBuffer(mimeType);
+                    sb.addEventListener('error', this.e.onSourceBufferError);
+                    sb.addEventListener('updateend', this.e.onSourceBufferUpdateEnd);
+                } catch (error) {
+                    Log.e(this.TAG, error.message);
+                    this._emitter.emit(MSEEvents.ERROR, {code: error.code, msg: error.message});
+                    return;
+                }
+            } else {
+                Log.v(this.TAG, `Notice: ${is.type} mimeType changed, origin: ${this._mimeTypes[is.type]}, target: ${mimeType}`);
+            }
+            this._mimeTypes[is.type] = mimeType;
+        }
+
+        if (!deferred) {
+            // deferred means this InitSegment has been pushed to pendingSegments queue
+            this._pendingSegments[is.type].push(is);
+        }
+        if (!firstInitSegment) {  // append immediately only if init segment in subsequence
+            if (this._sourceBuffers[is.type] && !this._sourceBuffers[is.type].updating) {
+                this._doAppendSegments();
+            }
+        }
+        if (Browser.safari && is.container === 'audio/mpeg' && is.mediaDuration > 0) {
+            // 'audio/mpeg' track under Safari may cause MediaElement's duration to be NaN
+            // Manually correct MediaSource.duration to make progress bar seekable, and report right duration
+            this._requireSetMediaDuration = true;
+            this._pendingMediaDuration = is.mediaDuration / 1000;  // in seconds
+            this._updateMediaSourceDuration();
+        }
+    }
+
+    appendMediaSegment(mediaSegment) {
+        let ms = mediaSegment;
+        this._pendingSegments[ms.type].push(ms);
+
+        if (this._config.autoCleanupSourceBuffer && this._needCleanupSourceBuffer()) {
+            this._doCleanupSourceBuffer();
+        }
+
+        let sb = this._sourceBuffers[ms.type];
+        if (sb && !sb.updating && !this._hasPendingRemoveRanges()) {
+            this._doAppendSegments();
+        }
+    }
+
+    flush() {
+        // remove all appended buffers
+        for (let type in this._sourceBuffers) {
+            if (!this._sourceBuffers[type]) {
+                continue;
+            }
+
+            // abort current buffer append algorithm
+            let sb = this._sourceBuffers[type];
             if (this._mediaSource.readyState === 'open') {
                 try {
-                    this._mediaSource.endOfStream();
-                } catch (e) {
-                    Log.e(this.TAG, 'Error ending MediaSource stream:', e);
+                    // If range removal algorithm is running, InvalidStateError will be throwed
+                    // Ignore it.
+                    sb.abort();
+                } catch (error) {
+                    Log.e(this.TAG, error.message);
                 }
             }
 
-            this._mediaSource = null;
+            // pending segments should be discard
+            let ps = this._pendingSegments[type];
+            ps.splice(0, ps.length);
+
+            if (this._mediaSource.readyState === 'closed') {
+                // Parent MediaSource object has been detached from HTMLMediaElement
+                continue;
+            }
+
+            // record ranges to be remove from SourceBuffer
+            for (let i = 0; i < sb.buffered.length; i++) {
+                let start = sb.buffered.start(i);
+                let end = sb.buffered.end(i);
+                this._pendingRemoveRanges[type].push({start, end});
+            }
+
+            // if sb is not updating, let's remove ranges now!
+            if (!sb.updating) {
+                this._doRemoveRanges();
+            }
+
+            // Safari 10 may get InvalidStateError in the later appendBuffer() after SourceBuffer.remove() call
+            // Internal parser's state may be invalid at this time. Re-append last InitSegment to workaround.
+            // Related issue: https://bugs.webkit.org/show_bug.cgi?id=159230
+            if (Browser.safari) {
+                let lastInitSegment = this._lastInitSegments[type];
+                if (lastInitSegment) {
+                    this._pendingSegments[type].push(lastInitSegment);
+                    if (!sb.updating) {
+                        this._doAppendSegments();
+                    }
+                }
+            }
+        }
+    }
+
+    endOfStream() {
+        let ms = this._mediaSource;
+        let sb = this._sourceBuffers;
+        if (!ms || ms.readyState !== 'open') {
+            if (ms && ms.readyState === 'closed' && this._hasPendingSegments()) {
+                // If MediaSource hasn't turned into open state, and there're pending segments
+                // Mark pending endOfStream, defer call until all pending segments appended complete
+                this._hasPendingEos = true;
+            }
+            return;
+        }
+        if (sb.video && sb.video.updating || sb.audio && sb.audio.updating) {
+            // If any sourcebuffer is updating, defer endOfStream operation
+            // See _onSourceBufferUpdateEnd()
+            this._hasPendingEos = true;
+        } else {
+            this._hasPendingEos = false;
+            // Notify media data loading complete
+            // This is helpful for correcting total duration to match last media segment
+            // Otherwise MediaElement's ended event may not be triggered
+            ms.endOfStream();
+        }
+    }
+
+    _needCleanupSourceBuffer() {
+        if (!this._config.autoCleanupSourceBuffer) {
+            return false;
         }
 
-        if (this._mediaElement) {
-            this._mediaElement.removeAttribute('src');
-            this._mediaElement.load();
-            this._mediaElement = null;
+        let currentTime = this._mediaElementProxy.getCurrentTime();
+
+        for (let type in this._sourceBuffers) {
+            let sb = this._sourceBuffers[type];
+            if (sb) {
+                let buffered = sb.buffered;
+                if (buffered.length >= 1) {
+                    if (currentTime - buffered.start(0) >= this._config.autoCleanupMaxBackwardDuration) {
+                        return true;
+                    }
+                }
+            }
         }
 
-        this._pendingData = [];
-        this._pendingDataSize = 0;
+        return false;
+    }
+
+    _doCleanupSourceBuffer() {
+        let currentTime = this._mediaElementProxy.getCurrentTime();
+
+        for (let type in this._sourceBuffers) {
+            let sb = this._sourceBuffers[type];
+            if (sb) {
+                let buffered = sb.buffered;
+                let doRemove = false;
+
+                for (let i = 0; i < buffered.length; i++) {
+                    let start = buffered.start(i);
+                    let end = buffered.end(i);
+
+                    if (start <= currentTime && currentTime < end + 3) {  // padding 3 seconds
+                        if (currentTime - start >= this._config.autoCleanupMaxBackwardDuration) {
+                            doRemove = true;
+                            let removeEnd = currentTime - this._config.autoCleanupMinBackwardDuration;
+                            this._pendingRemoveRanges[type].push({start: start, end: removeEnd});
+                        }
+                    } else if (end < currentTime) {
+                        doRemove = true;
+                        this._pendingRemoveRanges[type].push({start: start, end: end});
+                    }
+                }
+
+                if (doRemove && !sb.updating) {
+                    this._doRemoveRanges();
+                }
+            }
+        }
+    }
+
+    _updateMediaSourceDuration() {
+        let sb = this._sourceBuffers;
+        if (this._mediaElementProxy.getReadyState() === 0 || this._mediaSource.readyState !== 'open') {
+            return;
+        }
+        if ((sb.video && sb.video.updating) || (sb.audio && sb.audio.updating)) {
+            return;
+        }
+
+        let current = this._mediaSource.duration;
+        let target = this._pendingMediaDuration;
+
+        if (target > 0 && (isNaN(current) || target > current)) {
+            Log.v(this.TAG, `Update MediaSource duration from ${current} to ${target}`);
+            this._mediaSource.duration = target;
+        }
+
+        this._requireSetMediaDuration = false;
+        this._pendingMediaDuration = 0;
+    }
+
+    _doRemoveRanges() {
+        for (let type in this._pendingRemoveRanges) {
+            if (!this._sourceBuffers[type] || this._sourceBuffers[type].updating) {
+                continue;
+            }
+            let sb = this._sourceBuffers[type];
+            let ranges = this._pendingRemoveRanges[type];
+            while (ranges.length && !sb.updating) {
+                let range = ranges.shift();
+                sb.remove(range.start, range.end);
+            }
+        }
+    }
+
+    _doAppendSegments() {
+        let pendingSegments = this._pendingSegments;
+
+        for (let type in pendingSegments) {
+            if (!this._sourceBuffers[type] || this._sourceBuffers[type].updating || this._mediaSource.streaming === false) {
+                continue;
+            }
+
+            if (pendingSegments[type].length > 0) {
+                let segment = pendingSegments[type].shift();
+
+                if (typeof segment.timestampOffset === 'number' && isFinite(segment.timestampOffset)) {
+                    // For MPEG audio stream in MSE, if unbuffered-seeking occurred
+                    // We need explicitly set timestampOffset to the desired point in timeline for mpeg SourceBuffer.
+                    let currentOffset = this._sourceBuffers[type].timestampOffset;
+                    let targetOffset = segment.timestampOffset / 1000;  // in seconds
+
+                    let delta = Math.abs(currentOffset - targetOffset);
+                    if (delta > 0.1) {  // If time delta > 100ms
+                        Log.v(this.TAG, `Update MPEG audio timestampOffset from ${currentOffset} to ${targetOffset}`);
+                        this._sourceBuffers[type].timestampOffset = targetOffset;
+                    }
+                    delete segment.timestampOffset;
+                }
+
+                if (!segment.data || segment.data.byteLength === 0) {
+                    // Ignore empty buffer
+                    continue;
+                }
+
+                try {
+                    this._sourceBuffers[type].appendBuffer(segment.data);
+                    this._isBufferFull = false;
+                } catch (error) {
+                    this._pendingSegments[type].unshift(segment);
+                    if (error.code === 22) {  // QuotaExceededError
+                        /* Notice that FireFox may not throw QuotaExceededError if SourceBuffer is full
+                         * Currently we can only do lazy-load to avoid SourceBuffer become scattered.
+                         * SourceBuffer eviction policy may be changed in future version of FireFox.
+                         *
+                         * Related issues:
+                         * https://bugzilla.mozilla.org/show_bug.cgi?id=1279885
+                         * https://bugzilla.mozilla.org/show_bug.cgi?id=1280023
+                         */
+
+                        // report buffer full, abort network IO
+                        if (!this._isBufferFull) {
+                            this._emitter.emit(MSEEvents.BUFFER_FULL);
+                        }
+                        this._isBufferFull = true;
+                    } else {
+                        Log.e(this.TAG, error.message);
+                        this._emitter.emit(MSEEvents.ERROR, {code: error.code, msg: error.message});
+                    }
+                }
+            }
+        }
     }
 
     _onSourceOpen() {
-        Log.v(this.TAG, 'MediaSource sourceopen event');
-
-        try {
-            this._mimeType = this._getMimeType();
-            this._sourceBuffer = this._mediaSource.addSourceBuffer(this._mimeType);
-            this._sourceBuffer.addEventListener('updateend', this._onUpdateEnd);
-            this._sourceBuffer.mode = 'segments';
-
-            this._transmuxer = new Transmuxer(this._config);
-            this._transmuxer.onInitSegment = this._onInitSegment.bind(this);
-            this._transmuxer.onMediaSegment = this._onMediaSegment.bind(this);
-            this._transmuxer.onMediaInfo = this._onMediaInfo.bind(this);
-            this._transmuxer.onMetadata = this._onMetadata.bind(this);
-            this._transmuxer.onScriptData = this._onScriptData.bind(this);
-            this._transmuxer.onTimedID3 = this._onTimedID3.bind(this);
-            this._transmuxer.onError = this._onError.bind(this);
-
-            this.dispatchEvent(Events.MSE_SOURCE_OPEN);
-        } catch (e) {
-            Log.e(this.TAG, 'Error creating SourceBuffer:', e);
-            this.dispatchEvent(Events.ERROR, {
-                type: ErrorTypes.MEDIA_ERROR,
-                details: ErrorDetails.MSE_SOURCE_BUFFER_CONSTRUCTOR_EXCEPTION,
-                err: e
-            });
+        Log.v(this.TAG, 'MediaSource onSourceOpen');
+        this._mediaSource.removeEventListener('sourceopen', this.e.onSourceOpen);
+        // deferred sourcebuffer creation / initialization
+        if (this._pendingSourceBufferInit.length > 0) {
+            let pendings = this._pendingSourceBufferInit;
+            while (pendings.length) {
+                let segment = pendings.shift();
+                this.appendInitSegment(segment, true);
+            }
         }
+        // there may be some pending media segments, append them
+        if (this._hasPendingSegments()) {
+            this._doAppendSegments();
+        }
+        this._emitter.emit(MSEEvents.SOURCE_OPEN);
+    }
+
+    _onStartStreaming() {
+        Log.v(this.TAG, 'ManagedMediaSource onStartStreaming');
+        this._emitter.emit(MSEEvents.START_STREAMING);
+    }
+
+    _onEndStreaming() {
+        Log.v(this.TAG, 'ManagedMediaSource onEndStreaming');
+        this._emitter.emit(MSEEvents.END_STREAMING);
+    }
+
+    _onQualityChange() {
+        Log.v(this.TAG, 'ManagedMediaSource onQualityChange');
     }
 
     _onSourceEnded() {
-        Log.v(this.TAG, 'MediaSource sourceended event');
+        // fired on endOfStream
+        Log.v(this.TAG, 'MediaSource onSourceEnded');
     }
 
     _onSourceClose() {
-        Log.v(this.TAG, 'MediaSource sourceclose event');
-    }
-
-    _onUpdateEnd() {
-        Log.v(this.TAG, 'SourceBuffer updateend event');
-
-        this._isBufferFull = false;
-        this._pendingAppendLength = 0;
-
-        if (this._hasPendingData) {
-            this._hasPendingData = false;
-            this._appendPendingData();
-        }
-
-        this.dispatchEvent(Events.MSE_UPDATE_END);
-    }
-
-    _onBufferFull() {
-        Log.w(this.TAG, 'SourceBuffer buffer full');
-        this._isBufferFull = true;
-        this.dispatchEvent(Events.BUFFER_FULL);
-    }
-
-    _getMimeType() {
-        let mimeType = 'video/mp4; codecs="';
-
-        if (this._audioCodec && this._videoCodec) {
-            mimeType += `${this._videoCodec}, ${this._audioCodec}`;
-        } else if (this._videoCodec) {
-            mimeType += this._videoCodec;
-        } else if (this._audioCodec) {
-            mimeType += this._audioCodec;
-        } else {
-            mimeType += 'avc1.42e01e, mp4a.40.2';
-        }
-
-        mimeType += '"';
-        return mimeType;
-    }
-
-    _onInitSegment(initSegment, track) {
-        // Handle initialization segment if needed
-    }
-
-    _onMediaSegment(data, track, timestamp) {
-        if (!this._sourceBuffer || this._sourceBuffer.updating) {
-            this._hasPendingData = true;
-            this._pendingData.push({ data: data, track: track, timestamp: timestamp });
-            this._pendingDataSize += data.byteLength;
-            return;
-        }
-
-        try {
-            this._sourceBuffer.appendBuffer(data);
-            this._pendingAppendLength = data.byteLength;
-        } catch (e) {
-            Log.e(this.TAG, 'Error appending media segment:', e);
-            this._hasPendingData = true;
-            this._pendingData.push({ data: data, track: track, timestamp: timestamp });
-            this._pendingDataSize += data.byteLength;
-
-            if (e.name === 'QuotaExceededError') {
-                this._onBufferFull();
-            } else {
-                this.dispatchEvent(Events.ERROR, {
-                    type: ErrorTypes.MEDIA_ERROR,
-                    details: ErrorDetails.MSE_SOURCE_BUFFER_APPEND_EXCEPTION,
-                    err: e
-                });
+        // fired on detaching from media element
+        Log.v(this.TAG, 'MediaSource onSourceClose');
+        if (this._mediaSource && this.e != null) {
+            this._mediaSource.removeEventListener('sourceopen', this.e.onSourceOpen);
+            this._mediaSource.removeEventListener('sourceended', this.e.onSourceEnded);
+            this._mediaSource.removeEventListener('sourceclose', this.e.onSourceClose);
+            if (this._useManagedMediaSource) {
+                this._mediaSource.removeEventListener('startstreaming', this.e.onStartStreaming);
+                this._mediaSource.removeEventListener('endstreaming', this.e.onEndStreaming);
+                this._mediaSource.removeEventListener('qualitychange', this.e.onQualityChange);
             }
         }
     }
 
-    _onMediaInfo(mediaInfo) {
-        Log.v(this.TAG, 'MediaInfo received:', mediaInfo);
+    _hasPendingSegments() {
+        let ps = this._pendingSegments;
+        return ps.video.length > 0 || ps.audio.length > 0;
+    }
 
-        // Enhanced media info handling with color metadata
-        this.mediaInfo = mediaInfo;
-        
-        // Log enhanced metadata for debugging
-        console.log('Enhanced Media Info:', {
-            // Basic info
-            width: mediaInfo.width,
-            height: mediaInfo.height,
-            fps: mediaInfo.fps,
-            profile: mediaInfo.profile,
-            level: mediaInfo.level,
-            
-            // New color metadata
-            pix_fmt: mediaInfo.pix_fmt,
-            color_range: mediaInfo.color_range,
-            color_space: mediaInfo.color_space,
-            color_transfer: mediaInfo.color_transfer,
-            color_primaries: mediaInfo.color_primaries,
-            frame_rate: mediaInfo.frame_rate,
-            
-            // Additional technical info
-            chromaFormat: mediaInfo.chromaFormat,
-            bitDepth: mediaInfo.bitDepth,
-            videoCodec: mediaInfo.videoCodec,
-            audioCodec: mediaInfo.audioCodec
-        });
+    _hasPendingRemoveRanges() {
+        let prr = this._pendingRemoveRanges;
+        return prr.video.length > 0 || prr.audio.length > 0;
+    }
 
-        // Update codec strings for MediaSource
-        if (mediaInfo.videoCodec === 'avc') {
-            this._videoCodec = `avc1.${mediaInfo.profile.toString(16).padStart(2, '0')}${mediaInfo.level.toString(16).padStart(2, '0')}`;
+    _onSourceBufferUpdateEnd() {
+        if (this._requireSetMediaDuration) {
+            this._updateMediaSourceDuration();
+        } else if (this._hasPendingRemoveRanges()) {
+            this._doRemoveRanges();
+        } else if (this._hasPendingSegments()) {
+            this._doAppendSegments();
+        } else if (this._hasPendingEos) {
+            this.endOfStream();
         }
-
-        if (mediaInfo.audioCodec === 'aac') {
-            this._audioCodec = 'mp4a.40.2';
-        } else if (mediaInfo.audioCodec === 'mp3') {
-            this._audioCodec = 'mp4a.6b';
-        }
-
-        // Emit enhanced MEDIA_INFO event
-        this.dispatchEvent(Events.MEDIA_INFO, mediaInfo);
+        this._emitter.emit(MSEEvents.UPDATE_END);
     }
 
-    _onMetadata(metadata) {
-        this.dispatchEvent(Events.METADATA_ARRIVED, metadata);
+    _onSourceBufferError(e) {
+        Log.e(this.TAG, `SourceBuffer Error: ${e}`);
+        // this error might not always be fatal, just ignore it
     }
 
-    _onScriptData(scriptData) {
-        this.dispatchEvent(Events.SCRIPTDATA_ARRIVED, scriptData);
-    }
-
-    _onTimedID3(id3) {
-        this.dispatchEvent(Events.TIMED_ID3_METADATA_ARRIVED, id3);
-    }
-
-    _onError(type, info) {
-        this.dispatchEvent(Events.ERROR, {
-            type: type,
-            details: info.details,
-            err: info.err
-        });
-    }
-
-    _appendPendingData() {
-        if (!this._sourceBuffer || this._sourceBuffer.updating || this._pendingData.length === 0) {
-            return;
-        }
-
-        let data = this._pendingData.shift();
-        this._pendingDataSize -= data.data.byteLength;
-
-        try {
-            this._sourceBuffer.appendBuffer(data.data);
-            this._pendingAppendLength = data.data.byteLength;
-        } catch (e) {
-            Log.e(this.TAG, 'Error appending pending data:', e);
-            this._hasPendingData = true;
-            this._pendingData.unshift(data);
-            this._pendingDataSize += data.data.byteLength;
-
-            if (e.name === 'QuotaExceededError') {
-                this._onBufferFull();
-            }
-        }
-    }
-
-    feed(data) {
-        if (this._transmuxer) {
-            this._transmuxer.push(data);
-        }
-    }
-
-    seek(milliseconds) {
-        if (this._mediaElement && this._mediaSource.readyState === 'open') {
-            this._mediaElement.currentTime = milliseconds / 1000;
-        }
-    }
-
-    get mediaInfo() {
-        return this._mediaInfo;
-    }
-
-    set mediaInfo(info) {
-        this._mediaInfo = info;
-    }
-
-    get stats() {
-        return this._stats;
-    }
 }
 
 export default MSEController;
