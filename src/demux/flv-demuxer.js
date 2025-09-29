@@ -1321,6 +1321,13 @@ class FLVDemuxer {
                 continue;
             }
 
+            /* Add extended metadata */
+	        meta.pix_fmt = config.pix_fmt || null;
+            meta.color_range = config.color_range || null;
+            meta.color_space = config.color_space || null;
+            meta.color_transfer = config.color_transfer || null;
+            meta.color_primaries = config.color_primaries || null;
+            
             meta.codecWidth = config.codec_size.width;
             meta.codecHeight = config.codec_size.height;
             meta.presentWidth = config.present_size.width;
@@ -1483,6 +1490,14 @@ class FLVDemuxer {
                     let sps = new Uint8Array(arrayBuffer, dataOffset + offset, len);
 
                     let config = H265Parser.parseSPS(sps);
+
+                    /* Add extended metadata */
+	                meta.pix_fmt = config.pix_fmt || null;
+                    meta.color_range = config.color_range || null;
+                    meta.color_space = config.color_space || null;
+                    meta.color_transfer = config.color_transfer || null;
+                    meta.color_primaries = config.color_primaries || null;
+                    
                     meta.codecWidth = config.codec_size.width;
                     meta.codecHeight = config.codec_size.height;
                     meta.presentWidth = config.present_size.width;
